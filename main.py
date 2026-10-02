@@ -11,6 +11,7 @@ requirements.txt :
     uvicorn[standard]
     pymongo[srv]
     pydantic
+    orjson            (recommandé : sérialisation JSON beaucoup plus rapide)
 
 Commande de démarrage Render :
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -26,9 +27,15 @@ from bson import ObjectId
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
+
+try:  # JSON rapide si orjson est installé
+    import orjson  # noqa: F401
+    from fastapi.responses import ORJSONResponse as DefaultResponse
+except ImportError:
+    DefaultResponse = JSONResponse
 
 log = logging.getLogger("unik")
 logging.basicConfig(level=logging.INFO)
@@ -54,7 +61,8 @@ if not API_KEY:
     log.warning("API_KEY non défini : toutes les routes /api/db/* seront refusées (503).")
 
 client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000,
-                     retryWrites=True, appname="unik-system-api")
+                     retryWrites=True, appname="unik-system-api",
+                     maxPoolSize=30, minPoolSize=2, compressors="zlib")
 db = client[MONGODB_DB]
 
 INDEXES = [
@@ -82,7 +90,8 @@ async def lifespan(_: FastAPI):
     client.close()
 
 
-app = FastAPI(title="UNIK SYSTEM API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="UNIK SYSTEM API", version="3.0.0", lifespan=lifespan,
+              default_response_class=DefaultResponse)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
@@ -192,6 +201,11 @@ class FilterBody(Base):
 
 class NextIdBody(BaseModel):
     name: str
+    count: int = Field(default=1, ge=1, le=500)
+
+
+class BatchBody(BaseModel):
+    ops: list[dict] = Field(default_factory=list, max_length=200)
 
 
 # ------------------------------------------------------------ routes publiques
@@ -300,19 +314,51 @@ def api_find_one_and_update(body: UpdateBody):
 
 @app.post("/api/db/next_id", dependencies=[Depends(auth)])
 def api_next_id(body: NextIdBody):
-    """Compteur atomique côté serveur, initialisé sur le plus grand id existant."""
+    """Compteur atomique. Réserve `count` ids d'un coup : renvoie le dernier (seq) et le premier (first)."""
     name = body.name
     if name not in ID_COLLECTIONS:
         raise HTTPException(400, "Compteur non autorisé")
     for _ in range(5):
-        row = db.counters.find_one_and_update({"_id": name}, {"$inc": {"seq": 1}},
+        row = db.counters.find_one_and_update({"_id": name}, {"$inc": {"seq": body.count}},
                                               return_document=ReturnDocument.AFTER)
         if row:
-            return {"seq": int(row["seq"])}
+            seq = int(row["seq"])
+            return {"seq": seq, "first": seq - body.count + 1}
         last = db[name].find_one({"id": {"$type": "number"}}, {"id": 1}, sort=[("id", DESCENDING)])
         try:
             db.counters.insert_one({"_id": name, "seq": int(last["id"]) if last else 0})
         except DuplicateKeyError:
             pass  # un autre appel vient de l'initialiser : on réessaie
     raise HTTPException(500, "Impossible de générer l'identifiant")
- 
+
+
+# Plusieurs opérations en UNE seule requête HTTP (gain majeur de vitesse : moins d'aller-retours).
+# Exécution séquentielle, non transactionnelle : en cas d'erreur, les opérations déjà faites restent appliquées.
+BATCH_OPS = {
+    "find": (FindBody, api_find),
+    "find_one": (FindBody, api_find_one),
+    "insert_one": (InsertOneBody, api_insert_one),
+    "insert_many": (InsertManyBody, api_insert_many),
+    "update_one": (UpdateBody, api_update_one),
+    "delete_one": (FilterBody, api_delete_one),
+    "delete_many": (FilterBody, api_delete_many),
+    "count_documents": (FilterBody, api_count_documents),
+    "find_one_and_update": (UpdateBody, api_find_one_and_update),
+    "next_id": (NextIdBody, api_next_id),
+}
+
+
+@app.post("/api/db/batch", dependencies=[Depends(auth)])
+def api_batch(body: BatchBody):
+    results = []
+    for n, op in enumerate(body.ops):
+        spec = BATCH_OPS.get(op.get("op"))
+        if not spec:
+            raise HTTPException(400, f"Opération inconnue (#{n}) : {op.get('op')}")
+        model, fn = spec
+        try:
+            payload = model(**{k: v for k, v in op.items() if k != "op"})
+        except ValidationError as exc:
+            raise HTTPException(422, f"Opération #{n} invalide : {exc.errors()[0]['msg']}")
+        results.append(fn(payload))
+    return {"results": results}
