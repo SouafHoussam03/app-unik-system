@@ -1,4 +1,6 @@
-fastapi
-uvicorn
-pymongo
-python-dotenv
+﻿fastapi
+uvicorn[standard]
+pymongo[srv]
+pydantic
+PyJWT
+orjson
