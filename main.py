@@ -24,6 +24,8 @@ requirements.txt :
 
     pydantic
 
+    PyJWT
+
     orjson            (recommandé : sérialisation JSON beaucoup plus rapide)
 
 
@@ -35,6 +37,9 @@ Commande de démarrage Render :
 """
 
 import hmac
+import hashlib
+import secrets
+import time
 
 import logging
 
@@ -46,7 +51,7 @@ from datetime import date, datetime
 
 from typing import Any, Optional
 
-
+import jwt
 
 from bson import ObjectId
 
@@ -87,6 +92,13 @@ MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "app-unik-system")
 
 API_KEY = os.getenv("API_KEY", "")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_TTL_HOURS = int(os.getenv("JWT_TTL_HOURS", "8"))
+INITIAL_ADMIN_USERNAME = os.getenv("INITIAL_ADMIN_USERNAME", "").strip()
+INITIAL_ADMIN_PASSWORD = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+
+if not JWT_SECRET:
+    log.warning("JWT_SECRET non défini : les connexions utilisateur seront refusées.")
 
 
 
@@ -118,7 +130,7 @@ if not MONGODB_URI:
 
 if not API_KEY:
 
-    log.warning("API_KEY non défini : toutes les routes /api/db/\* seront refusées (503).")
+    log.warning("API_KEY non défini : toutes les routes /api/db/* seront refusées (503).")
 
 
 
@@ -153,6 +165,7 @@ INDEXES = [
     ("movements", "product_id", False, False),
 
     ("settings", "key", True, False),
+    ("users", "username", True, False),
 
 ]
 
@@ -160,29 +173,48 @@ INDEXES = [
 
 
 
+def seed_initial_admin():
+    """Crée le premier administrateur uniquement si la collection users est vide."""
+    if db.users.count_documents({}) > 0:
+        return
+    if not INITIAL_ADMIN_USERNAME or not INITIAL_ADMIN_PASSWORD:
+        log.warning("Aucun utilisateur trouvé : définissez INITIAL_ADMIN_USERNAME et INITIAL_ADMIN_PASSWORD sur Render.")
+        return
+
+    username = INITIAL_ADMIN_USERNAME.lower()
+    user = {
+        "id": secrets.token_hex(12),
+        "username": username,
+        "role": "ADMIN",
+        "permissions": sorted(PERMISSIONS),
+        "is_active": True,
+        "password_hash": _hash_password(INITIAL_ADMIN_PASSWORD),
+        "created_at": datetime.utcnow().isoformat(),
+        "last_login": "",
+        "failed_attempts": 0,
+        "locked_until": 0,
+        "token_version": 0,
+    }
+    try:
+        db.users.insert_one(user)
+        log.info("Premier administrateur créé : %s", username)
+    except DuplicateKeyError:
+        pass
+
+
 @asynccontextmanager
-
 async def lifespan(_: FastAPI):
-
     for coll, field, unique, sparse in INDEXES:
-
         try:
-
             db[coll].create_index([(field, ASCENDING)], unique=unique, sparse=sparse)
-
-        except Exception as exc:  # index existant différent, données dupliquées...
-
+        except Exception as exc:
             log.warning("Index ignoré %s.%s : %s", coll, field, exc)
-
+    seed_initial_admin()
     yield
-
     client.close()
 
 
-
-
-
-app = FastAPI(title="UNIK SYSTEM API", version="3.0.0", lifespan=lifespan,
+app = FastAPI(title="UNIK SYSTEM API", version="4.0.0-secure", lifespan=lifespan,
 
               default_response_class=DefaultResponse)
 
@@ -205,19 +237,103 @@ async def mongo_error_handler(_: Request, exc: PyMongoError):
 
 
 # ------------------------------------------------------------ sécurité
+PERMISSIONS = {
+    "dashboard", "devis", "factures", "bc", "bl",
+    "stock", "clients", "settings", "users",
+}
+ROLES = {"ADMIN", "MEMBER"}
 
-def auth(x_api_key: Optional[str] = Header(default=None)):
 
+def api_key_auth(x_api_key: Optional[str] = Header(default=None)):
     if not API_KEY:
-
         raise HTTPException(503, "API_KEY non configurée sur le serveur")
-
     if not x_api_key or not hmac.compare_digest(x_api_key.encode(), API_KEY.encode()):
-
         raise HTTPException(401, "API key invalide")
+    return True
 
 
+def _hash_password(password: str) -> str:
+    """Hash mot de passe avec scrypt + sel aléatoire."""
+    if not isinstance(password, str) or len(password) < 8:
+        raise HTTPException(422, "Le mot de passe doit contenir au moins 8 caractères")
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt$14$8$1${salt.hex()}${dk.hex()}"
 
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        alg, n_exp, r, p, salt_hex, hash_hex = encoded.split("$")
+        if alg != "scrypt":
+            return False
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+        dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**int(n_exp),
+                            r=int(r), p=int(p), dklen=len(expected))
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+
+def make_token(user: dict) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": str(user["id"]),
+        "username": user["username"],
+        "role": user["role"],
+        "permissions": user.get("permissions", []),
+        "iat": now,
+        "exp": now + JWT_TTL_HOURS * 3600,
+        "type": "access",
+        "ver": int(user.get("token_version", 0)),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def current_user(
+    x_api_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    api_key_auth(x_api_key)
+    if not JWT_SECRET:
+        raise HTTPException(503, "JWT_SECRET non configuré sur le serveur")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Connexion utilisateur requise")
+
+    token = authorization[7:].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Session expirée. Veuillez vous reconnecter.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Session invalide")
+
+    user = db.users.find_one({"id": payload.get("sub")}, {"_id": 0})
+    if not user:
+        raise HTTPException(401, "Utilisateur introuvable")
+    if not user.get("is_active", True):
+        raise HTTPException(403, "Compte bloqué")
+    if int(payload.get("ver", -1)) != int(user.get("token_version", 0)):
+        raise HTTPException(401, "Session révoquée. Veuillez vous reconnecter.")
+    return user
+
+
+def require_admin(user: dict):
+    if user.get("role") != "ADMIN":
+        raise HTTPException(403, "Accès réservé à l'administrateur")
+    return user
+
+
+def normalize_permissions(role: str, permissions: Optional[list[str]]) -> list[str]:
+    role = role.upper()
+    if role not in ROLES:
+        raise HTTPException(422, "Rôle invalide")
+    if role == "ADMIN":
+        return sorted(PERMISSIONS)
+    p = [str(x) for x in (permissions or []) if str(x) in PERMISSIONS and str(x) != "users"]
+    if "dashboard" not in p:
+        p.insert(0, "dashboard")
+    return sorted(set(p))
 
 
 def coll_of(name: str):
@@ -418,6 +534,178 @@ class BatchBody(BaseModel):
 
 
 
+
+# ------------------------------------------------------------ modèles d'authentification
+class LoginBody(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class UserCreateBody(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=200)
+    role: str = "MEMBER"
+    permissions: list[str] = Field(default_factory=list)
+    is_active: bool = True
+
+
+class UserUpdateBody(BaseModel):
+    user_id: str = Field(min_length=1, max_length=100)
+    role: Optional[str] = None
+    permissions: Optional[list[str]] = None
+    is_active: Optional[bool] = None
+
+
+class UserPasswordBody(BaseModel):
+    user_id: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=8, max_length=200)
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": str(user["id"]),
+        "username": user["username"],
+        "role": user.get("role", "MEMBER"),
+        "permissions": user.get("permissions", []),
+        "is_active": user.get("is_active", True),
+        "created_at": user.get("created_at", ""),
+        "last_login": user.get("last_login", ""),
+    }
+
+
+# ------------------------------------------------------------ authentification
+@app.post("/api/auth/login")
+def api_login(body: LoginBody, _: bool = Depends(api_key_auth)):
+    username = body.username.strip().lower()
+    user = db.users.find_one({"username": username})
+
+    if not user:
+        raise HTTPException(401, "Identifiant ou mot de passe incorrect")
+
+    now = int(time.time())
+    locked_until = int(user.get("locked_until", 0) or 0)
+    if locked_until > now:
+        minutes = max(1, (locked_until - now + 59) // 60)
+        raise HTTPException(423, f"Compte temporairement bloqué. Réessayez dans {minutes} min.")
+
+    if not _verify_password(body.password, user.get("password_hash", "")):
+        failed = int(user.get("failed_attempts", 0) or 0) + 1
+        update = {"$set": {"failed_attempts": failed}}
+        if failed >= 5:
+            update["$set"]["locked_until"] = now + 15 * 60
+            update["$set"]["failed_attempts"] = 0
+        db.users.update_one({"id": user["id"]}, update)
+        raise HTTPException(401, "Identifiant ou mot de passe incorrect")
+
+    if not user.get("is_active", True):
+        raise HTTPException(403, "Compte bloqué. Contactez l'administrateur.")
+
+    db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"failed_attempts": 0, "locked_until": 0,
+                  "last_login": datetime.utcnow().isoformat()}}
+    )
+    user["failed_attempts"] = 0
+    user["locked_until"] = 0
+    return {"access_token": make_token(user), "token_type": "bearer", "user": public_user(user)}
+
+
+@app.post("/api/auth/me")
+def api_me(user: dict = Depends(current_user)):
+    return {"user": public_user(user)}
+
+
+# ------------------------------------------------------------ gestion utilisateurs (ADMIN uniquement)
+@app.post("/api/users/list")
+def api_users_list(user: dict = Depends(current_user)):
+    require_admin(user)
+    rows = db.users.find({}, {"_id": 0, "password_hash": 0, "failed_attempts": 0, "locked_until": 0}).sort("username", ASCENDING)
+    return {"users": [public_user(r) for r in rows]}
+
+
+@app.post("/api/users/create")
+def api_users_create(body: UserCreateBody, user: dict = Depends(current_user)):
+    require_admin(user)
+
+    username = body.username.strip().lower()
+    if any(ch.isspace() for ch in username) or not username.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(422, "Nom d'utilisateur invalide : lettres, chiffres, _ ou - uniquement")
+
+    role = body.role.strip().upper()
+    permissions = normalize_permissions(role, body.permissions)
+    new_user = {
+        "id": secrets.token_hex(12),
+        "username": username,
+        "role": role,
+        "permissions": permissions,
+        "is_active": body.is_active,
+        "password_hash": _hash_password(body.password),
+        "created_at": datetime.utcnow().isoformat(),
+        "last_login": "",
+        "failed_attempts": 0,
+        "locked_until": 0,
+    }
+    try:
+        db.users.insert_one(new_user)
+    except DuplicateKeyError:
+        raise HTTPException(409, "Ce nom d'utilisateur existe déjà")
+    return {"user": public_user(new_user)}
+
+
+@app.post("/api/users/update")
+def api_users_update(body: UserUpdateBody, user: dict = Depends(current_user)):
+    require_admin(user)
+
+    target = db.users.find_one({"id": body.user_id})
+    if not target:
+        raise HTTPException(404, "Utilisateur introuvable")
+
+    if target["id"] == user["id"] and body.role and body.role.upper() != "ADMIN":
+        raise HTTPException(400, "Vous ne pouvez pas retirer le rôle ADMIN de votre propre compte.")
+
+    update = {}
+    if body.role is not None:
+        update["role"] = body.role.upper()
+        update["permissions"] = normalize_permissions(update["role"], body.permissions)
+    elif body.permissions is not None:
+        update["permissions"] = normalize_permissions(target.get("role", "MEMBER"), body.permissions)
+
+    if body.is_active is not None:
+        if target["id"] == user["id"] and not body.is_active:
+            raise HTTPException(400, "Vous ne pouvez pas bloquer votre propre compte.")
+        update["is_active"] = body.is_active
+
+    if not update:
+        return {"user": public_user(target)}
+
+    # Empêche de désactiver / rétrograder le dernier administrateur.
+    resulting_role = update.get("role", target.get("role", "MEMBER"))
+    resulting_active = update.get("is_active", target.get("is_active", True))
+    if target.get("role") == "ADMIN" and (resulting_role != "ADMIN" or not resulting_active):
+        admin_count = db.users.count_documents({"role": "ADMIN", "is_active": True})
+        if admin_count <= 1:
+            raise HTTPException(400, "Impossible de désactiver ou rétrograder le dernier administrateur.")
+
+    db.users.update_one({"id": target["id"]}, {"$set": update, "$inc": {"token_version": 1}})
+    target.update(update)
+    target["token_version"] = int(target.get("token_version", 0)) + 1
+    return {"user": public_user(target)}
+
+
+@app.post("/api/users/password")
+def api_users_password(body: UserPasswordBody, user: dict = Depends(current_user)):
+    require_admin(user)
+    target = db.users.find_one({"id": body.user_id})
+    if not target:
+        raise HTTPException(404, "Utilisateur introuvable")
+    db.users.update_one(
+        {"id": target["id"]},
+        {"$set": {"password_hash": _hash_password(body.password),
+                  "failed_attempts": 0, "locked_until": 0},
+         "$inc": {"token_version": 1}}
+    )
+    return {"ok": True}
+
 # ------------------------------------------------------------ routes publiques
 
 @app.get("/")
@@ -452,7 +740,7 @@ def health():
 
 # ------------------------------------------------------------ routes base de données
 
-@app.post("/api/db/find", dependencies=[Depends(auth)])
+@app.post("/api/db/find", dependencies=[Depends(current_user)])
 
 def api_find(body: FindBody):
 
@@ -476,7 +764,7 @@ def api_find(body: FindBody):
 
 
 
-@app.post("/api/db/find_one", dependencies=[Depends(auth)])
+@app.post("/api/db/find_one", dependencies=[Depends(current_user)])
 
 def api_find_one(body: FindBody):
 
@@ -492,7 +780,7 @@ def api_find_one(body: FindBody):
 
 
 
-@app.post("/api/db/insert_one", dependencies=[Depends(auth)])
+@app.post("/api/db/insert_one", dependencies=[Depends(current_user)])
 
 def api_insert_one(body: InsertOneBody):
 
@@ -512,7 +800,7 @@ def api_insert_one(body: InsertOneBody):
 
 
 
-@app.post("/api/db/insert_many", dependencies=[Depends(auth)])
+@app.post("/api/db/insert_many", dependencies=[Depends(current_user)])
 
 def api_insert_many(body: InsertManyBody):
 
@@ -538,7 +826,7 @@ def api_insert_many(body: InsertManyBody):
 
 
 
-@app.post("/api/db/update_one", dependencies=[Depends(auth)])
+@app.post("/api/db/update_one", dependencies=[Depends(current_user)])
 
 def api_update_one(body: UpdateBody):
 
@@ -566,7 +854,7 @@ def api_update_one(body: UpdateBody):
 
 
 
-@app.post("/api/db/delete_one", dependencies=[Depends(auth)])
+@app.post("/api/db/delete_one", dependencies=[Depends(current_user)])
 
 def api_delete_one(body: FilterBody):
 
@@ -578,7 +866,7 @@ def api_delete_one(body: FilterBody):
 
 
 
-@app.post("/api/db/delete_many", dependencies=[Depends(auth)])
+@app.post("/api/db/delete_many", dependencies=[Depends(current_user)])
 
 def api_delete_many(body: FilterBody):
 
@@ -590,7 +878,7 @@ def api_delete_many(body: FilterBody):
 
 
 
-@app.post("/api/db/count_documents", dependencies=[Depends(auth)])
+@app.post("/api/db/count_documents", dependencies=[Depends(current_user)])
 
 def api_count_documents(body: FilterBody):
 
@@ -602,7 +890,7 @@ def api_count_documents(body: FilterBody):
 
 
 
-@app.post("/api/db/find_one_and_update", dependencies=[Depends(auth)])
+@app.post("/api/db/find_one_and_update", dependencies=[Depends(current_user)])
 
 def api_find_one_and_update(body: UpdateBody):
 
@@ -626,7 +914,7 @@ def api_find_one_and_update(body: UpdateBody):
 
 
 
-@app.post("/api/db/next_id", dependencies=[Depends(auth)])
+@app.post("/api/db/next_id", dependencies=[Depends(current_user)])
 
 def api_next_id(body: NextIdBody):
 
@@ -698,7 +986,7 @@ BATCH_OPS = {
 
 
 
-@app.post("/api/db/batch", dependencies=[Depends(auth)])
+@app.post("/api/db/batch", dependencies=[Depends(current_user)])
 
 def api_batch(body: BatchBody):
 
