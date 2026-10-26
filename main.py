@@ -36,6 +36,8 @@ Commande de démarrage Render :
 
 """
 
+import base64
+import binascii
 import hmac
 import hashlib
 import secrets
@@ -599,7 +601,12 @@ class MessageListBody(BaseModel):
 
 class MessageSendBody(BaseModel):
     recipient_id: str = Field(min_length=1, max_length=100)
-    body: str = Field(min_length=1, max_length=4000)
+    body: str = Field(default="", max_length=4000)
+    attachment: Optional[dict] = None
+
+
+class MessageAttachmentBody(BaseModel):
+    message_id: str = Field(min_length=1, max_length=100)
 
 
 def public_user(user: dict) -> dict:
@@ -839,15 +846,57 @@ def api_messages_list(body: MessageListBody, user: dict = Depends(current_user))
         {"sender_id": other_id, "recipient_id": user["id"]},
     ]}
     rows = list(db.messages.find(query, {"_id": 0}).sort("created_at", ASCENDING).limit(body.limit))
+    # Le listing ne contient que les métadonnées du fichier, pas le contenu base64.
+    for row in rows:
+        att = row.get("attachment")
+        if isinstance(att, dict):
+            att.pop("data", None)
     return {"messages": rows}
+
+
+@app.post("/api/messages/attachment")
+def api_messages_attachment(body: MessageAttachmentBody, user: dict = Depends(current_user)):
+    message = db.messages.find_one({
+        "id": body.message_id,
+        "$or": [
+            {"sender_id": user["id"]},
+            {"recipient_id": user["id"]},
+        ],
+    }, {"_id": 0, "attachment": 1, "id": 1})
+    if not message or not isinstance(message.get("attachment"), dict):
+        raise HTTPException(404, "Pièce jointe introuvable")
+    return {"attachment": message["attachment"]}
+
+
+MAX_MESSAGE_ATTACHMENT_BYTES = 2 * 1024 * 1024
+MESSAGE_ATTACHMENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+}
 
 
 @app.post("/api/messages/send")
 def api_messages_send(body: MessageSendBody, user: dict = Depends(current_user)):
     recipient_id = body.recipient_id.strip()
-    message_body = body.body.strip()
-    if not message_body:
-        raise HTTPException(422, "Le message ne peut pas être vide")
+    message_body = (body.body or "").strip()
+    attachment = None
+
+    if len(message_body) > 4000:
+        raise HTTPException(422, "Le message dépasse 4 000 caractères")
+    if not message_body and not body.attachment:
+        raise HTTPException(422, "Ajoutez un texte ou une pièce jointe")
     if recipient_id == user["id"]:
         raise HTTPException(400, "Vous ne pouvez pas vous envoyer un message")
 
@@ -858,6 +907,35 @@ def api_messages_send(body: MessageSendBody, user: dict = Depends(current_user))
     if not recipient:
         raise HTTPException(404, "Destinataire introuvable ou compte inactif")
 
+    if body.attachment is not None:
+        item = body.attachment
+        name = os.path.basename(str(item.get("name", "")).strip())
+        mime = str(item.get("mime", "")).strip().lower()
+        encoded = item.get("data", "")
+        if not name or len(name) > 180 or not isinstance(encoded, str):
+            raise HTTPException(422, "Métadonnées de pièce jointe invalides")
+        ext = os.path.splitext(name)[1].lower()
+        expected_mime = MESSAGE_ATTACHMENT_TYPES.get(ext)
+        if not expected_mime or mime != expected_mime:
+            raise HTTPException(415, "Format de pièce jointe non autorisé")
+        max_encoded = ((MAX_MESSAGE_ATTACHMENT_BYTES + 2) // 3) * 4 + 8
+        if not encoded or len(encoded) > max_encoded:
+            raise HTTPException(413, "La pièce jointe dépasse la limite de 2 Mo")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise HTTPException(422, "Données de pièce jointe invalides")
+        if not raw or len(raw) > MAX_MESSAGE_ATTACHMENT_BYTES:
+            raise HTTPException(413, "La pièce jointe doit faire entre 1 octet et 2 Mo")
+        if int(item.get("size", len(raw)) or 0) != len(raw):
+            raise HTTPException(422, "Taille de pièce jointe incohérente")
+        attachment = {
+            "name": name,
+            "mime": mime,
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+
     _message_rate_limit(user["id"])
     message = {
         "id": secrets.token_hex(12),
@@ -866,6 +944,7 @@ def api_messages_send(body: MessageSendBody, user: dict = Depends(current_user))
         "recipient_id": recipient_id,
         "recipient_name": str(recipient.get("display_name") or recipient.get("username") or "Membre"),
         "body": message_body,
+        "attachment": attachment,
         "created_at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
     }
     db.messages.insert_one(message)
