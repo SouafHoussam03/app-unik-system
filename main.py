@@ -609,6 +609,15 @@ class MessageAttachmentBody(BaseModel):
     message_id: str = Field(min_length=1, max_length=100)
 
 
+class MessageUpdateBody(BaseModel):
+    message_id: str = Field(min_length=1, max_length=100)
+    body: str = Field(min_length=1, max_length=4000)
+
+
+class MessageDeleteBody(BaseModel):
+    message_id: str = Field(min_length=1, max_length=100)
+
+
 def public_user(user: dict) -> dict:
     """Projection publique : n'expose jamais le hash du mot de passe."""
     return {
@@ -950,6 +959,47 @@ def api_messages_send(body: MessageSendBody, user: dict = Depends(current_user))
     db.messages.insert_one(message)
     message.pop("_id", None)
     return {"ok": True, "message": message}
+
+
+
+
+@app.post("/api/messages/update")
+def api_messages_update(body: MessageUpdateBody, user: dict = Depends(current_user)):
+    """Un expéditeur peut modifier uniquement le texte de son propre message."""
+    message_text = body.body.strip()
+    if not message_text:
+        raise HTTPException(422, "Le message ne peut pas être vide")
+    if len(message_text) > 4000:
+        raise HTTPException(422, "Le message dépasse 4 000 caractères")
+
+    result = db.messages.update_one(
+        {"id": body.message_id, "sender_id": str(user["id"])},
+        {"$set": {
+            "body": message_text,
+            "edited": True,
+            "edited_at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(404, "Message introuvable ou modification non autorisée")
+
+    updated = db.messages.find_one(
+        {"id": body.message_id, "sender_id": str(user["id"])},
+        {"_id": 0, "attachment.data": 0},
+    )
+    return {"ok": True, "message": jsonable(updated)}
+
+
+@app.post("/api/messages/delete")
+def api_messages_delete(body: MessageDeleteBody, user: dict = Depends(current_user)):
+    """Un utilisateur peut supprimer uniquement les messages qu'il a envoyés."""
+    result = db.messages.delete_one(
+        {"id": body.message_id, "sender_id": str(user["id"])}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Message introuvable ou suppression non autorisée")
+    # La pièce jointe Base64 est intégrée au document message et supprimée avec lui.
+    return {"ok": True, "deleted": True, "message_id": body.message_id}
 
 
 # ------------------------------------------------------------ routes publiques
